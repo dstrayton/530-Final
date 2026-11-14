@@ -1,0 +1,43 @@
+{
+  "random_state": 42,
+  "test_fraction": 0.2,
+  "features": [
+    "Material",
+    "Infill Pattern",
+    "Layer Thickness (mm)",
+    "Infill Density (%)",
+    "Speed (mm/s)"
+  ],
+  "target": "Peak Stress (MPa)",
+  "selected_method": "Random forest",
+  "forest_parameters": {
+    "n_estimators": 200,
+    "min_samples_leaf": 3,
+    "max_features": 1.0
+  },
+  "source_files": [
+    "performance_raw.csv",
+    "descriptions_raw.csv",
+    "reviews_raw.csv"
+  ],
+  "training_source_rows": 453,
+  "held_out_rows": 91,
+  "scores": [
+    {
+      "Method": "Material mean",
+      "MAE_MPa": 4.366117133873092
+    },
+    {
+      "Method": "Random forest",
+      "MAE_MPa": 2.857697230237681
+    }
+  ],
+  "limitations": [
+    "Closed printers only",
+    "Uneven material coverage",
+    "No batch IDs",
+    "Final predictions are fitted estimates",
+    "PLA-GLOW alias needs source confirmation",
+    "Source URLs, test protocol, and brand transfer need documentation"
+  ]
+}
