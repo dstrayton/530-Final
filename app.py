@@ -169,8 +169,65 @@ def recommend(project, settings, mode="agent"):
     else:
         # Same evidence budget available to the agent, supplied upfront to the baseline.
         prompt += "\nFull evidence catalog:\n" + json.dumps(cards)
-    agent = ToolCallingAgent(model=make_model(), tools=tools, instructions=instructions,
-                             max_steps=8, verbosity_level=0)
+    # Explain exactly how the agent must submit its final answer.
+    instructions += """
+    IMPORTANT: When calling the final_answer tool, its answer argument
+    must contain the COMPLETE structured object specified above.
+    Do not put only the explanation paragraph in the answer argument.
+
+    Include all eight keys:
+    status, recommended_material, alternative_material, explanation,
+    question, source_ids, limitations.
+
+    Correction: this list contains SEVEN keys; include exactly those seven.
+    """
+
+    # Validate before the agent finishes, allowing it to correct errors.
+    def check_final_answer(final_answer, memory, agent):
+        try:
+            checked = validate_answer(final_answer, cards)
+        except (ValueError, TypeError, KeyError) as error:
+            raise AssertionError(
+                "Your final answer failed validation: "
+                + str(error)
+                + ". Call final_answer again with the complete seven-key "
+                "JSON object required by the instructions, not a paragraph."
+            ) from error
+
+        # Also check that the agent retrieved the required evidence.
+        if mode == "agent" and checked["status"] == "recommend":
+            read_names = {
+                call.get("material")
+                for call in calls
+                if call["tool"] == "read_material"
+            }
+
+            compared = any(
+                call["tool"] == "compare_performance"
+                for call in calls
+            )
+
+            selected = {
+                checked["recommended_material"],
+                checked["alternative_material"],
+            }
+
+            assert compared and selected.issubset(read_names), (
+                "Before finishing, call compare_performance and "
+                "read_material for both selected materials."
+            )
+
+        return True
+
+    agent = ToolCallingAgent(
+        model=make_model(),
+        tools=tools,
+        instructions=instructions,
+        max_steps=8,
+        verbosity_level=1,
+        final_answer_checks=[check_final_answer],
+    )
+
     raw = agent.run(prompt)
     answer = validate_answer(raw, cards)
     if mode == "agent" and answer["status"] == "recommend":
