@@ -381,6 +381,13 @@ def render_recommendation(st, result):
 PRIORITY_NAMES = ["Strength", "Stiffness", "Ease of printing", "Flexibility", "Surface finish"]
 
 
+def available_priority_choices(rank_index, selections):
+    """Keep this rank's choice; hide priorities used at all other ranks."""
+    used_elsewhere = {name for index, name in enumerate(selections)
+                      if index != rank_index and name}
+    return [""] + [name for name in PRIORITY_NAMES if name not in used_elsewhere]
+
+
 def format_priority_ranking(priorities):
     """Require a complete ranking and make its direction explicit to the LLM."""
     if set(priorities) != set(PRIORITY_NAMES) or set(priorities.values()) != {1, 2, 3, 4, 5}:
@@ -443,29 +450,41 @@ def main():
         with left:
             with st.container(border=True, key="project_form"):
                 st.markdown('<div class="ff-heading">Your project</div>', unsafe_allow_html=True)
-                with st.form("project", border=False):
+                # Outside a form so each choice reruns the page immediately,
+                # updating the options available in the other rank dropdowns.
+                with st.container():
                     project = st.text_area("What are you making?", height=115,
                         placeholder="A rigid indoor electronics enclosure with a clean finish.")
                     st.markdown("**Rank your priorities**")
-                    st.caption("1 = highest priority · 5 = lowest priority. Use each number once.")
+                    st.caption("1 = highest priority · 5 = lowest priority. Choose a different priority for each rank.")
+                    st.caption("Selected priorities disappear from the other lists. Clear a selection to make it available again.")
+                    selections = [st.session_state.get(f"priority_at_rank_{rank}", "")
+                                  for rank in range(1, 6)]
                     priorities = {}
-                    for index, label in enumerate(PRIORITY_NAMES):
-                        priorities[label] = st.selectbox(
-                            label, [1, 2, 3, 4, 5], index=index,
-                            key="rank_" + label,
-                            help="Choose a unique rank. 1 matters most and 5 matters least.")
+                    for index in range(5):
+                        rank = index + 1
+                        choices = available_priority_choices(index, selections)
+                        current = selections[index]
+                        selected = st.selectbox(
+                            f"Rank {rank}" + (" — highest priority" if rank == 1 else " — lowest priority" if rank == 5 else ""),
+                            choices, index=choices.index(current) if current in choices else 0,
+                            format_func=lambda name: name or "— Select a priority —",
+                            key=f"priority_at_rank_{rank}",
+                            help="Each priority can appear once. Choose the blank option to clear this rank.")
+                        if selected:
+                            priorities[selected] = rank
                     with st.expander("Print settings (optional)"):
                         layer = st.selectbox("Layer thickness (mm)", [0.1, 0.2, 0.3], index=1)
                         infill = st.selectbox("Infill (%)", [20, 50, 80], index=1)
                         speed = st.selectbox("Speed (mm/s)", [30, 50, 70], index=1)
                         pattern = st.selectbox("Infill pattern", ["grid", "triangles", "zigzag"])
-                    submitted = st.form_submit_button("Recommend filament", use_container_width=True)
+                    submitted = st.button("Recommend filament", key="submit_recommendation", use_container_width=True)
             if submitted:
                 st.session_state.pop("result", None)
                 if not project.strip():
                     st.warning("Describe your project first, then choose Recommend filament.")
-                elif len(set(priorities.values())) != 5:
-                    st.warning("Use each rank from 1 to 5 exactly once. Two priorities currently share the same rank.")
+                elif set(priorities) != set(PRIORITY_NAMES) or set(priorities.values()) != {1, 2, 3, 4, 5}:
+                    st.warning("Choose one different priority for every rank from 1 to 5 before submitting.")
                 else:
                     settings = {"layer": layer, "infill": infill, "speed": speed, "pattern": pattern}
                     try:
