@@ -29,9 +29,79 @@ def make_model():
     )
 
 
-def build_evidence(settings):
+REVIEW_TOPICS = {
+    "Strength": "strength strong durable durability tough toughness brittle brittleness break breaking broken weak",
+    "Stiffness": "stiff stiffness rigid rigidity bend bending deformation flex",
+    "Ease of printing": "easy ease printability beginner reliable consistent adhesion sticking clog clogs clogging stringing warping",
+    "Flexibility": "flexible flexibility elastic elasticity bend bending soft rubber rubbery stretch stretching",
+    "Surface finish": "surface finish smooth smoother texture rough roughness detail details stringing appearance glossy matte",
+}
+
+
+def review_queries(project):
+    """Separate the project words from ranked priorities; expand priority vocabulary."""
+    import re
+    description, marker, ranking = project.partition("Priority ranking (")
+    ranked = re.findall(r"(?m)^\s*([1-5])\.\s*(Strength|Stiffness|Ease of printing|Flexibility|Surface finish)\s*$", ranking) if marker else []
+    if ranked:
+        # TF-IDF receives more copies of terms from higher-ranked priorities.
+        weighted_terms = [REVIEW_TOPICS[name] for rank, name in ranked for _ in range(6 - int(rank))]
+    else:
+        # Direct script/benchmark requests may state priorities in ordinary prose.
+        words = set(re.findall(r"[a-z]+", description.lower()))
+        triggers = {
+            "Strength": {"strength", "strong", "durable", "tough"},
+            "Stiffness": {"stiffness", "stiff", "rigid", "rigidity"},
+            "Ease of printing": {"easy", "ease", "beginner", "printability"},
+            "Flexibility": {"flexibility", "flexible", "elastic", "rubbery"},
+            "Surface finish": {"finish", "smooth", "surface", "appearance", "decorative"},
+        }
+        weighted_terms = [REVIEW_TOPICS[name] for name, terms in triggers.items() if words & terms]
+    return description.strip(), " ".join(weighted_terms)
+
+
+def rank_customer_reviews(reviews, project):
+    """Rank original review text with lexical TF-IDF; stars never affect ordering."""
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    import numpy as np
+    ranked = reviews.copy()
+    ranked["relevance_score"] = 0.0
+    ranked["matched_terms"] = [[] for _ in range(len(ranked))]
+    project_query, priority_query = review_queries(project)
+    if ranked.empty or not (project_query or priority_query):
+        return ranked
+    vectorizer = TfidfVectorizer(stop_words="english", ngram_range=(1, 2))
+    try:
+        documents = vectorizer.fit_transform(ranked["review"].fillna(""))
+    except ValueError:
+        # An empty vocabulary is a no-match result, not permission to invent reviews.
+        return ranked
+    queries = vectorizer.transform([project_query, priority_query])
+    project_scores = (documents @ queries[0].T).toarray().ravel()
+    priority_scores = (documents @ queries[1].T).toarray().ravel()
+    if queries[0].nnz and queries[1].nnz:
+        scores = 0.60 * project_scores + 0.40 * priority_scores
+        combined_query = queries[0] * 0.60 + queries[1] * 0.40
+    elif queries[0].nnz:
+        scores, combined_query = project_scores, queries[0]
+    else:
+        scores, combined_query = priority_scores, queries[1]
+    ranked["relevance_score"] = scores
+    features = vectorizer.get_feature_names_out()
+    contributions = documents.multiply(combined_query).tocsr()
+    matches = []
+    for i in range(len(ranked)):
+        row = contributions.getrow(i)
+        order = np.argsort(-row.data, kind="stable")[:8]
+        matches.append([str(features[row.indices[j]]) for j in order if row.data[j] > 0])
+    ranked["matched_terms"] = matches
+    return ranked
+
+
+def build_evidence(settings, project=""):
     """Find each material's nearest OBSERVED configuration; do not extrapolate."""
     performance, descriptions, reviews = load_data()
+    reviews = rank_customer_reviews(reviews, project)
     supported = sorted(set(performance.Material) & set(descriptions.Material))
     cards = {}
     for material in supported:
@@ -45,9 +115,10 @@ def build_evidence(settings):
         )
         row = rows.sort_values(["distance", "Sample No"]).iloc[0]
         material_reviews = reviews[reviews.Material == material].sort_values(
-            ["rating_out_of_5", "source_id"])
-        # Show both a lower-rated and higher-rated report, not only favorable reviews.
-        examples = pd.concat([material_reviews.head(1), material_reviews.tail(1)]).drop_duplicates("source_id")
+            ["relevance_score", "source_id"], ascending=[False, True])
+        # Prefer actual lexical matches; do not pad relevant results with unrelated ones.
+        matching = material_reviews[material_reviews.relevance_score > 0]
+        examples = matching.head(3) if not matching.empty else material_reviews.head(2)
         description = descriptions[descriptions.Material == material].iloc[0]
         cards[material] = {
             "material": material,
@@ -60,7 +131,8 @@ def build_evidence(settings):
             "sample_count": int(len(rows)),
             "description": {"source_id": description.source_id, "text": description.Description},
             "reviews_available": int(len(material_reviews)),
-            "review_examples": examples[["source_id", "product", "rating_out_of_5", "review"]].to_dict("records"),
+            "review_selection": "Relevant word matches" if not matching.empty else "General examples: no matching review wording found",
+            "review_examples": examples[["source_id", "product", "rating_out_of_5", "review", "relevance_score", "matched_terms"]].to_dict("records"),
         }
     return cards
 
@@ -184,6 +256,12 @@ Explain when nearest available settings differ. Do not invent performance number
 prices, temperature limits, confidence percentages, or universal compatibility rules.
 Treat descriptions as supplied secondary evidence, not independently verified facts.
 Reviews are product-specific anecdotes; preserve product/brand differences.
+Review examples are ranked by wording overlap with the project and priority-related
+terms, weighted toward higher-ranked priorities. This retrieval is not sentiment
+classification or a failure-rate estimate. Check matched_terms and review_selection.
+If no wording matches, general examples are explicitly labeled: do not claim those
+reviews demonstrate experience with this particular project. Read the actual excerpt;
+matching 'strong' or 'stringing' alone does not establish a positive or negative claim.
 For missing essential requirements ask a focused question (clarify). For unsupported
 materials, required certified/safety-critical use, exact load guarantees, numerical
 temperature certification, or absent evidence return insufficient_evidence.
@@ -268,7 +346,7 @@ def recommend(project, settings, mode="agent"):
         return {"answer": validate_answer(answer, {}), "tool_calls": [], "evidence": {},
                 "request_check": request_check, "model": os.getenv("OPENAI_MODEL", "gpt-4.1-mini"), "mode": mode}
     from smolagents import ToolCallingAgent, tool
-    cards = build_evidence(settings)
+    cards = build_evidence(settings, project)
     calls = []
 
     @tool
@@ -456,13 +534,16 @@ def render_evidence(st, cards):
     with tabs[2]:
         for card in cards:
             st.markdown(f'**{card["material"]}** · {card["reviews_available"]} reviews in the cleaned dataset')
+            st.caption(card.get("review_selection", "Review excerpts"))
             if not card["review_examples"]:
                 st.caption("No review evidence available for this material.")
             for review in card["review_examples"]:
                 with st.expander(f'{review["rating_out_of_5"]}/5 · {review["source_id"]}'):
+                    if review.get("matched_terms"):
+                        st.caption("Matching words: " + ", ".join(review["matched_terms"]))
                     st.write(review["product"])
                     st.write(review["review"])
-        st.caption("A lower- and higher-rated example where available. Product-specific reports, not measured properties or a complete sentiment summary.")
+        st.caption("Up to three excerpts ranked by project wording and ranked-priority terms. Positive and negative reviews are eligible. Word relevance is not factual confidence or an overall customer-satisfaction score. General examples are labeled when no wording matches.")
 
 
 def render_recommendation(st, result):
@@ -561,7 +642,7 @@ def main():
             st.markdown('<div class="ff-heading">Compare materials</div>', unsafe_allow_html=True)
             result = st.session_state.get("result")
             settings = st.session_state.get("submitted_settings", {"layer": 0.2, "infill": 50, "speed": 50, "pattern": "grid"})
-            cards = build_evidence(settings)
+            cards = build_evidence(settings, st.session_state.get("submitted_project", ""))
             choices = list(cards)
             defaults = st.session_state.get("compare_names", ["PLA", "PETG"])
             defaults = [name for name in defaults if name in choices]
@@ -618,6 +699,7 @@ def main():
                             result = recommend(project + "\n" + format_priority_ranking(priorities), settings)
                             st.session_state["result"] = result
                             st.session_state["submitted_settings"] = settings
+                            st.session_state["submitted_project"] = project + "\n" + format_priority_ranking(priorities)
                             # Clear comparison widget state so Compare options uses this result.
                             st.session_state.pop("comparison_selection", None)
                     except Exception as error:
