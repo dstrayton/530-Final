@@ -92,6 +92,8 @@ question: focused follow-up or null;
 source_ids: list of supplied IDs actually used;
 limitations: list of specific limitations.
 For non-recommend status both material fields must be null.
+When user priorities are ranked, 1 is the HIGHEST priority and 5 is the LOWEST.
+Respect their relative order; do not interpret these ranks as 1-low/5-high ratings.
 """
 
 
@@ -169,8 +171,23 @@ def recommend(project, settings, mode="agent"):
     else:
         # Same evidence budget available to the agent, supplied upfront to the baseline.
         prompt += "\nFull evidence catalog:\n" + json.dumps(cards)
+    # Keep the final-answer formatting fix from the successful local test.
+    instructions += "\nPass the complete seven-key structured object to final_answer, not only a paragraph."
+
+    def check_final_answer(final_answer, memory, agent):
+        try:
+            checked = validate_answer(final_answer, cards)
+        except (ValueError, TypeError, KeyError) as error:
+            raise AssertionError("Return the complete seven-key JSON object. " + str(error)) from error
+        if mode == "agent" and checked["status"] == "recommend":
+            read_names = {call.get("material") for call in calls if call["tool"] == "read_material"}
+            assert any(call["tool"] == "compare_performance" for call in calls), "Call compare_performance first."
+            assert {checked["recommended_material"], checked["alternative_material"]}.issubset(read_names), "Read both selected materials before finishing."
+        return True
+
     agent = ToolCallingAgent(model=make_model(), tools=tools, instructions=instructions,
-                             max_steps=8, verbosity_level=0)
+                             max_steps=8, verbosity_level=0,
+                             final_answer_checks=[check_final_answer])
     raw = agent.run(prompt)
     answer = validate_answer(raw, cards)
     if mode == "agent" and answer["status"] == "recommend":
@@ -361,6 +378,18 @@ def render_recommendation(st, result):
         st.caption("Spool artwork is illustrative. Colors do not indicate a brand or available product color.")
 
 
+PRIORITY_NAMES = ["Strength", "Stiffness", "Ease of printing", "Flexibility", "Surface finish"]
+
+
+def format_priority_ranking(priorities):
+    """Require a complete ranking and make its direction explicit to the LLM."""
+    if set(priorities) != set(PRIORITY_NAMES) or set(priorities.values()) != {1, 2, 3, 4, 5}:
+        raise ValueError("Use each priority rank from 1 to 5 exactly once.")
+    ordered = sorted(priorities.items(), key=lambda item: item[1])
+    return ("Priority ranking (1 = highest priority; 5 = lowest priority):\n"
+            + "\n".join(f"{rank}. {name}" for name, rank in ordered))
+
+
 def main():
     import streamlit as st
     st.set_page_config(page_title="Filament Finder", page_icon=str(ASSETS / "logo.png") if (ASSETS / "logo.png").exists() else "🧵", layout="wide")
@@ -417,11 +446,14 @@ def main():
                 with st.form("project", border=False):
                     project = st.text_area("What are you making?", height=115,
                         placeholder="A rigid indoor electronics enclosure with a clean finish.")
-                    st.markdown("**Your priorities**")
-                    st.caption("1 = less important · 5 = most important")
+                    st.markdown("**Rank your priorities**")
+                    st.caption("1 = highest priority · 5 = lowest priority. Use each number once.")
                     priorities = {}
-                    for label, default in [("Strength", 3), ("Stiffness", 3), ("Flexibility", 1), ("Surface finish", 4), ("Ease of printing", 4)]:
-                        priorities[label] = st.slider(label, 1, 5, default, key="priority_" + label)
+                    for index, label in enumerate(PRIORITY_NAMES):
+                        priorities[label] = st.selectbox(
+                            label, [1, 2, 3, 4, 5], index=index,
+                            key="rank_" + label,
+                            help="Choose a unique rank. 1 matters most and 5 matters least.")
                     with st.expander("Print settings (optional)"):
                         layer = st.selectbox("Layer thickness (mm)", [0.1, 0.2, 0.3], index=1)
                         infill = st.selectbox("Infill (%)", [20, 50, 80], index=1)
@@ -432,11 +464,13 @@ def main():
                 st.session_state.pop("result", None)
                 if not project.strip():
                     st.warning("Describe your project first, then choose Recommend filament.")
+                elif len(set(priorities.values())) != 5:
+                    st.warning("Use each rank from 1 to 5 exactly once. Two priorities currently share the same rank.")
                 else:
                     settings = {"layer": layer, "infill": infill, "speed": speed, "pattern": pattern}
                     try:
                         with st.spinner("Comparing estimates and checking material evidence…"):
-                            result = recommend(project + "\nPriority importance (1 low, 5 high): " + json.dumps(priorities), settings)
+                            result = recommend(project + "\n" + format_priority_ranking(priorities), settings)
                             st.session_state["result"] = result
                             st.session_state["submitted_settings"] = settings
                             # Clear comparison widget state so Compare options uses this result.
